@@ -7,162 +7,139 @@ require('dotenv').config();
 
 const app = express();
 const httpServer = createServer(app);
-
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// --- Twilio ICE (/ice) -------------------------------------------------------
+// ---------- Twilio ICE ----------
 const twilio = Twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 app.get('/ice', async (req, res) => {
   try {
-    const token = await twilio.tokens.create({ ttl: 3600 }); // 1 hour
+    const token = await twilio.tokens.create({ ttl: 3600 });
     res.json({ iceServers: token.iceServers });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// --- Simple in-memory host registry -----------------------------------------
-const { randomUUID } = require('crypto');
+// ---------- Registry ----------
+const hosts = new Map();   // hostKey -> { hostKey, room, busy, registeredAt, lastSeen }
+const sessions = new Map();// room    -> hostKey
 
-function newRoomCode() {
-  return 'r_' + Math.random().toString(36).slice(2, 8);
-}
-
-/**
- * hosts: Map<hostId, {
- *   hostId: string,
- *   room: string,
- *   busy: boolean,
- *   registeredAt: number (ms),
- *   lastSeen: number (ms)
- * }>
- */
-const hosts = new Map();
-
+function newRoomCode() { return 'r_' + Math.random().toString(36).slice(2, 8); }
 function counts() {
-  const total = hosts.size;
-  let busy = 0;
-  for (const h of hosts.values()) if (h.busy) busy++;
+  const total = hosts.size; let busy = 0; for (const h of hosts.values()) if (h.busy) busy++;
   return { total, busy, avail: total - busy };
 }
-
 function logAvailability(prefix) {
-  const { total, busy, avail } = counts();
+  const { total, avail } = counts();
   console.log(`${prefix} - ${avail}/${total} hosts currently available`);
 }
 
-// --- Host endpoints ----------------------------------------------------------
-
-/**
- * Host registers itself and receives a dedicated room.
- * Body: { tag?: string } (optional metadata)
- * Returns: { hostId, room }
- */
+// ---------- Host endpoints ----------
+// Body: { hostKey?: string } – hostKey is a stable id persisted by the host app
 app.post('/hosts/register', (req, res) => {
-  const hostId = randomUUID();
-  const room = newRoomCode();
   const now = Date.now();
+  const hostKey = (req.body && req.body.hostKey) || null;
 
-  hosts.set(hostId, {
-    hostId,
-    room,
-    busy: false,
-    registeredAt: now,
-    lastSeen: now
-  });
-
-  logAvailability('Host connected');
-
-  res.json({ hostId, room });
-});
-
-/**
- * Host heartbeat to keep itself from expiring.
- * Body: { hostId }
- */
-app.post('/hosts/heartbeat', (req, res) => {
-  const { hostId } = req.body || {};
-  const h = hostId && hosts.get(hostId);
-  if (!h) return res.status(404).json({ error: 'host_not_found' });
-  h.lastSeen = Date.now();
-  return res.json({ ok: true });
-});
-
-/**
- * Host marks itself available again after finishing a client session.
- * Body: { hostId }
- */
-app.post('/hosts/release', (req, res) => {
-  const { hostId } = req.body || {};
-  const h = hostId && hosts.get(hostId);
-  if (!h) return res.status(404).json({ error: 'host_not_found' });
-  h.busy = false;
-  h.lastSeen = Date.now();
-  logAvailability('Host released');
-  return res.json({ ok: true });
-});
-
-/**
- * Host unregisters on shutdown.
- * Body: { hostId }
- */
-app.post('/hosts/unregister', (req, res) => {
-  const { hostId } = req.body || {};
-  if (hostId && hosts.has(hostId)) hosts.delete(hostId);
-  logAvailability('Host disconnected');
-  return res.json({ ok: true });
-});
-
-// --- User endpoint -----------------------------------------------------------
-
-/**
- * User requests a host. Server assigns the first available (not busy) host.
- * Returns 200 { room, hostId } or 503 { error:"no_hosts" }
- * Logs:
- *  - "User connected - A/B hosts currently available"
- *  - or "WARNING: User rejected - all hosts ((B)) occupied!"
- */
-app.post('/users/claim', (req, res) => {
-  // Pick first available host
-  let chosen = null;
-  for (const h of hosts.values()) {
-    if (!h.busy) { chosen = h; break; }
+  // If we have a stable key and it already exists: replace (prevents duplicates on restart)
+  if (hostKey && hosts.has(hostKey)) {
+    const prev = hosts.get(hostKey);
+    // drop any old session using previous room
+    for (const [room, hid] of sessions.entries()) if (hid === hostKey) sessions.delete(room);
+    const room = newRoomCode();
+    hosts.set(hostKey, { hostKey, room, busy: false, registeredAt: prev.registeredAt, lastSeen: now });
+    logAvailability('Host connected');
+    return res.json({ hostId: hostKey, room });
   }
 
-  const { total, busy, avail } = counts();
+  // No key provided: create one and return it
+  const newKey = hostKey || ('hk_' + Math.random().toString(36).slice(2, 12));
+  const room = newRoomCode();
+  hosts.set(newKey, { hostKey: newKey, room, busy: false, registeredAt: now, lastSeen: now });
+  logAvailability('Host connected');
+  res.json({ hostId: newKey, room });
+});
 
+// Body: { hostKey }
+app.post('/hosts/heartbeat', (req, res) => {
+  const { hostKey } = req.body || {};
+  const h = hostKey && hosts.get(hostKey);
+  if (!h) return res.status(404).json({ error: 'host_not_found' });
+  h.lastSeen = Date.now();
+  res.json({ ok: true });
+});
+
+// Body: { hostKey }
+app.post('/hosts/release', (req, res) => {
+  const { hostKey } = req.body || {};
+  const h = hostKey && hosts.get(hostKey);
+  if (!h) return res.status(404).json({ error: 'host_not_found' });
+  // clear sessions for this host
+  for (const [room, hid] of sessions.entries()) if (hid === hostKey) sessions.delete(room);
+  h.busy = false; h.lastSeen = Date.now();
+  logAvailability('Host released');
+  res.json({ ok: true });
+});
+
+// Body: { hostKey }
+app.post('/hosts/unregister', (req, res) => {
+  const { hostKey } = req.body || {};
+  if (hostKey && hosts.has(hostKey)) {
+    for (const [room, hid] of sessions.entries()) if (hid === hostKey) sessions.delete(room);
+    hosts.delete(hostKey);
+  }
+  logAvailability('Host disconnected');
+  res.json({ ok: true });
+});
+
+// ---------- User endpoints ----------
+// Claim first available host
+app.post('/users/claim', (req, res) => {
+  let chosen = null;
+  for (const h of hosts.values()) { if (!h.busy) { chosen = h; break; } }
+  const { total } = counts();
   if (!chosen) {
     console.warn(`WARNING: User rejected - all hosts ((${total})) occupied!`);
     return res.status(503).json({ error: 'no_hosts' });
   }
-
-  chosen.busy = true;
-  chosen.lastSeen = Date.now();
-
-  // After assigning, log with the updated availability
+  chosen.busy = true; chosen.lastSeen = Date.now();
+  sessions.set(chosen.room, chosen.hostKey);
   const after = counts();
   console.log(`User connected - ${after.avail}/${after.total} hosts currently available`);
-
-  return res.json({ room: chosen.room, hostId: chosen.hostId });
+  res.json({ room: chosen.room, hostId: chosen.hostKey });
 });
 
-// --- Housekeeping: purge dead hosts (stopped heartbeating) -------------------
-const HOST_TTL_MS = 5 * 60 * 1000; // 5 minutes without heartbeat → remove
+// Optional: user explicitly ends session (frees host immediately)
+// Body: { room?: string, hostId?: string }
+app.post('/users/leave', (req, res) => {
+  const { room, hostId } = req.body || {};
+  let key = hostId || (room && sessions.get(room));
+  const h = key && hosts.get(key);
+  if (!h) return res.status(404).json({ error: 'host_not_found' });
+  if (room) sessions.delete(room);
+  h.busy = false; h.lastSeen = Date.now();
+  logAvailability('User ended');
+  res.json({ ok: true });
+});
+
+// ---------- Cleanup ----------
+const HEARTBEAT_SECS = 60;           // matches client default
+const HOST_TTL_MS = HEARTBEAT_SECS * 2500; // ~150s: 2.5 heartbeats
 setInterval(() => {
   const now = Date.now();
   let removed = 0;
-  for (const [id, h] of hosts.entries()) {
-    if (now - h.lastSeen > HOST_TTL_MS) { hosts.delete(id); removed++; }
+  for (const [key, h] of hosts.entries()) {
+    if (now - h.lastSeen > HOST_TTL_MS) {
+      for (const [room, hid] of sessions.entries()) if (hid === key) sessions.delete(room);
+      hosts.delete(key); removed++;
+    }
   }
   if (removed > 0) logAvailability(`Purged ${removed} stale host(s)`);
 }, 60 * 1000);
 
-// --- Health ------------------------------------------------------------------
+// ---------- Health & Start ----------
 app.get('/health', (_req, res) => res.json({ ok: true, hosts: counts() }));
 
-// --- Start -------------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
 httpServer.listen(PORT, () => {
   console.log(`Matcher + /ice listening on :${PORT}`);
+  logAvailability('Server started');
 });
