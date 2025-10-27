@@ -122,7 +122,7 @@ app.post('/users/leave', (req, res) => {
 
 // ---------- Cleanup ----------
 const HEARTBEAT_SECS = 60;           // matches client default
-const HOST_TTL_MS = HEARTBEAT_SECS * 2500; // ~150s: 2.5 heartbeats
+const HOST_TTL_MS = HEARTBEAT_SECS * 500; // ~30s: 0.5 heartbeats
 setInterval(() => {
   const now = Date.now();
   let removed = 0;
