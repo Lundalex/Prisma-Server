@@ -31,7 +31,7 @@ last_avail = -1
 last_total = -1
 function logAvailability(prefix) {
   const { total, avail } = counts();
-  if (avail != last_avail && last_total != total) {
+  if (avail != last_avail || last_total != total) {
     last_avail = avail; last_total = total;
     console.log(`${prefix} - ${avail}/${total} hosts currently available`);
   }
