@@ -60,7 +60,6 @@ app.post('/hosts/register', (req, res) => {
 // Body: { hostKey }
 app.post('/hosts/heartbeat', (req, res) => {
   const { hostKey } = req.body || {};
-  console.log('Heartbeat recieved');
   const h = hostKey && hosts.get(hostKey);
   if (!h) return res.status(404).json({ error: 'host_not_found' });
   h.lastSeen = Date.now();
