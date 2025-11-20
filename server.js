@@ -9,7 +9,6 @@ const httpServer = createServer(app);
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// ---------- Twilio ICE ----------
 const twilio = Twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 app.get('/ice', async (req, res) => {
   try {
@@ -18,18 +17,17 @@ app.get('/ice', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ---------- Registry ----------
-const hosts = new Map();   // hostKey -> { hostKey, room, busy, registeredAt, lastSeen }
-const sessions = new Map();// room    -> hostKey
+const hosts = new Map();
+const sessions = new Map();
 
 function newRoomCode() { return 'r_' + Math.random().toString(36).slice(2, 8); }
 function counts() {
   const total = hosts.size; let busy = 0; for (const h of hosts.values()) if (h.busy) busy++;
   return { total, busy, avail: total - busy };
 }
-last_avail = -1
-last_total = -1
-last_prefix = ""
+let last_avail = -1;
+let last_total = -1;
+let last_prefix = "";
 function logAvailability(prefix) {
   const { total, avail } = counts();
   if (avail != last_avail || last_total != total || last_prefix != "Host released") {
@@ -39,16 +37,26 @@ function logAvailability(prefix) {
   last_prefix = prefix;
 }
 
-// ---------- Host endpoints ----------
-// Body: { hostKey?: string } – hostKey is a stable id persisted by the host app
+function cleanupOrphanedSessions() {
+  for (const [room, hostKey] of sessions.entries()) {
+    if (!hosts.has(hostKey)) sessions.delete(room);
+  }
+  outer: for (const h of hosts.values()) {
+    if (!h.busy) continue;
+    for (const [room, hostKey] of sessions.entries()) {
+      if (hostKey === h.hostKey && room === h.room) continue outer;
+    }
+    h.busy = false;
+    logAvailability('Fixed orphaned host');
+  }
+}
+
 app.post('/hosts/register', (req, res) => {
   const now = Date.now();
   const hostKey = (req.body && req.body.hostKey) || null;
 
-  // If we have a stable key and it already exists: replace (prevents duplicates on restart)
   if (hostKey && hosts.has(hostKey)) {
     const prev = hosts.get(hostKey);
-    // drop any old session using previous room
     for (const [room, hid] of sessions.entries()) if (hid === hostKey) sessions.delete(room);
     const room = newRoomCode();
     hosts.set(hostKey, { hostKey, room, busy: false, registeredAt: prev.registeredAt, lastSeen: now });
@@ -56,7 +64,6 @@ app.post('/hosts/register', (req, res) => {
     return res.json({ hostId: hostKey, room });
   }
 
-  // No key provided: create one and return it
   const newKey = hostKey || ('hk_' + Math.random().toString(36).slice(2, 12));
   const room = newRoomCode();
   hosts.set(newKey, { hostKey: newKey, room, busy: false, registeredAt: now, lastSeen: now });
@@ -64,7 +71,6 @@ app.post('/hosts/register', (req, res) => {
   res.json({ hostId: newKey, room });
 });
 
-// Body: { hostKey }
 app.post('/hosts/heartbeat', (req, res) => {
   const { hostKey } = req.body || {};
   const h = hostKey && hosts.get(hostKey);
@@ -73,19 +79,16 @@ app.post('/hosts/heartbeat', (req, res) => {
   res.json({ ok: true });
 });
 
-// Body: { hostKey }
 app.post('/hosts/release', (req, res) => {
   const { hostKey } = req.body || {};
   const h = hostKey && hosts.get(hostKey);
   if (!h) return res.status(404).json({ error: 'host_not_found' });
-  // clear sessions for this host
   for (const [room, hid] of sessions.entries()) if (hid === hostKey) sessions.delete(room);
   h.busy = false; h.lastSeen = Date.now();
   logAvailability('Host released');
   res.json({ ok: true });
 });
 
-// Body: { hostKey }
 app.post('/hosts/unregister', (req, res) => {
   const { hostKey } = req.body || {};
   if (hostKey && hosts.has(hostKey)) {
@@ -96,9 +99,9 @@ app.post('/hosts/unregister', (req, res) => {
   res.json({ ok: true });
 });
 
-// ---------- User endpoints ----------
-// Claim first available host
 app.post('/users/claim', (req, res) => {
+  cleanupOrphanedSessions();
+
   let chosen = null;
   for (const h of hosts.values()) { if (!h.busy) { chosen = h; break; } }
   const { total } = counts();
@@ -113,8 +116,6 @@ app.post('/users/claim', (req, res) => {
   res.json({ room: chosen.room, hostId: chosen.hostKey });
 });
 
-// Optional: user explicitly ends session (frees host immediately)
-// Body: { room?: string, hostId?: string }
 app.post('/users/leave', (req, res) => {
   const { room, hostId } = req.body || {};
   let key = hostId || (room && sessions.get(room));
@@ -126,9 +127,8 @@ app.post('/users/leave', (req, res) => {
   res.json({ ok: true });
 });
 
-// ---------- Cleanup ----------
-const HEARTBEAT_SECS = 5;           // matches client default
-const HOST_TTL_MS = HEARTBEAT_SECS * 1000 * 4; // ~20s: 4 heartbeats
+const HEARTBEAT_SECS = 5;
+const HOST_TTL_MS = HEARTBEAT_SECS * 1000 * 4;
 setInterval(() => {
   const now = Date.now();
   let removed = 0;
@@ -141,7 +141,6 @@ setInterval(() => {
   if (removed > 0) logAvailability(`Purged ${removed} stale host(s)`);
 }, 60 * 1000);
 
-// ---------- Health & Start ----------
 app.get('/health', (_req, res) => res.json({ ok: true, hosts: counts() }));
 
 const PORT = process.env.PORT || 3000;
