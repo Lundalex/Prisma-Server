@@ -127,8 +127,8 @@ app.post('/users/leave', (req, res) => {
   res.json({ ok: true });
 });
 
-const HEARTBEAT_SECS = 5;
-const HOST_TTL_MS = HEARTBEAT_SECS * 1000 * 4;
+const HEARTBEAT_SECS = 2;
+const HOST_TTL_MS = HEARTBEAT_SECS * 1000 * 3;
 setInterval(() => {
   const now = Date.now();
   let removed = 0;
